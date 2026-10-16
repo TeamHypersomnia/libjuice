@@ -75,6 +75,22 @@ static server_turn_alloc_t *find_allocation(server_turn_alloc_t allocs[], int si
 	return allocs + pos;
 }
 
+// A peer must not be the server host itself: relaying to the unspecified, loopback or link-local
+// address would let any client holding credentials reach services listening only locally on the
+// server host (see CVE-2020-26262 for coturn). IPv4-mapped IPv6 addresses are checked as IPv4.
+static bool is_forbidden_peer(const addr_record_t *peer) {
+	const struct sockaddr *sa = (const struct sockaddr *)&peer->addr;
+	if (addr_is_any(sa) || addr_is_local(sa)) {
+		if (JLOG_WARN_ENABLED) {
+			char peer_str[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(peer, peer_str, ADDR_MAX_STRING_LEN);
+			JLOG_WARN("Forbidden TURN peer address %s", peer_str);
+		}
+		return true;
+	}
+	return false;
+}
+
 static void delete_allocation(server_turn_alloc_t *alloc) {
 	if (alloc->state != SERVER_TURN_ALLOC_FULL)
 		return;
@@ -1017,6 +1033,18 @@ int server_process_turn_create_permission(juice_server_t *server, const stun_mes
 		                                credentials);
 	}
 
+	// RFC 5766 9.2. Receiving a CreatePermission Request:
+	// The server MAY impose restrictions on the IP address allowed in the XOR-PEER-ADDRESS
+	// attribute -- if a value is not allowed, the server rejects the request with a 403 (Forbidden)
+	// error.
+	for (size_t i = 0; i < msg->peers_size; ++i) {
+		if (is_forbidden_peer(msg->peers + i)) {
+			return server_answer_stun_error(server, msg->transaction_id, src, msg->msg_method,
+			                                403, // Forbidden
+			                                credentials);
+		}
+	}
+
 	for (size_t i = 0; i < msg->peers_size; ++i) {
 		const addr_record_t *peer = msg->peers + i;
 		if (!turn_set_permission(&alloc->map, msg->transaction_id, peer, PERMISSION_LIFETIME)) {
@@ -1083,6 +1111,11 @@ int server_process_turn_channel_bind(juice_server_t *server, const stun_message_
 	// record that the channel binding is now active. It also updates its data structures to record
 	// that the corresponding permission has been installed or refreshed.
 	const addr_record_t *peer = msg->peers;
+	if (is_forbidden_peer(peer)) {
+		return server_answer_stun_error(server, msg->transaction_id, src, msg->msg_method,
+		                                403, // Forbidden
+		                                credentials);
+	}
 	if (!turn_bind_channel(&alloc->map, peer, msg->transaction_id, channel, BIND_LIFETIME)) {
 		server_answer_stun_error(server, msg->transaction_id, src, msg->msg_method, 500,
 		                         credentials);
