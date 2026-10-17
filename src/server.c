@@ -75,12 +75,33 @@ static server_turn_alloc_t *find_allocation(server_turn_alloc_t allocs[], int si
 	return allocs + pos;
 }
 
+// Multicast reaches the server host's own network segment, never a single remote peer.
+static bool is_multicast(const struct sockaddr *sa) {
+	switch (sa->sa_family) {
+	case AF_INET: {
+		const uint8_t *b = (const uint8_t *)&((const struct sockaddr_in *)sa)->sin_addr;
+		return (b[0] & 0xF0) == 0xE0; // 224.0.0.0/4
+	}
+	case AF_INET6: {
+		const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
+		if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+			const uint8_t *b = (const uint8_t *)&sin6->sin6_addr + 12;
+			return (b[0] & 0xF0) == 0xE0;
+		}
+		return IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr);
+	}
+	default:
+		return false;
+	}
+}
+
 // A peer must not be the server host itself: relaying to the unspecified, loopback or link-local
 // address would let any client holding credentials reach services listening only locally on the
-// server host (see CVE-2020-26262 for coturn). IPv4-mapped IPv6 addresses are checked as IPv4.
+// server host (see CVE-2020-26262 for coturn), and multicast would reach its network segment.
+// IPv4-mapped IPv6 addresses are checked as IPv4.
 static bool is_forbidden_peer(const addr_record_t *peer) {
 	const struct sockaddr *sa = (const struct sockaddr *)&peer->addr;
-	if (addr_is_any(sa) || addr_is_local(sa)) {
+	if (addr_is_any(sa) || addr_is_local(sa) || is_multicast(sa)) {
 		if (JLOG_WARN_ENABLED) {
 			char peer_str[ADDR_MAX_STRING_LEN];
 			addr_record_to_string(peer, peer_str, ADDR_MAX_STRING_LEN);
